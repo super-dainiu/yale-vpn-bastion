@@ -261,6 +261,12 @@ def main() -> int:
                 url = urlsplit(page.url)
                 safe_url = urlunsplit((url.scheme, url.netloc, url.path, "", ""))
                 log(f"Stopped at {safe_url}")
+                # What the page was asking for at the point it gave up. Duo in
+                # particular has several prompts that need different handling,
+                # and the URL alone does not say which one is on screen.
+                shown = " ".join(page_text(page).split())[:400]
+                if shown:
+                    log(f"Page showed: {shown}")
             except PlaywrightError:
                 pass
         return 1

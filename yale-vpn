@@ -1,96 +1,46 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-TABLE=200
-MARK=0x66
 TUN=yalevpn
 RUNTIME=/run/yale-vpn
 ENDPOINT=https://access.yale.edu
 USER_AGENT='AnyConnect Linux_64 4.10.07061'
-YALE_DNS=(172.18.190.12 172.18.190.20 172.18.190.28)
+VENV=/opt/yale-vpn/venv
+SLICE="$VENV/bin/vpn-slice"
 
-cloud_network() {
-  if [[ -r $RUNTIME/cloud.env ]]; then
-    # shellcheck disable=SC1091
-    source "$RUNTIME/cloud.env"
-    if ip link show "$CLOUD_IFACE" >/dev/null 2>&1 &&
-       ip -o -4 addr show dev "$CLOUD_IFACE" |
-         grep -q " ${CLOUD_IP}/"; then
-      return
-    fi
-  fi
+# Yale's BGP-announced prefixes (AS29) plus the internal resolver subnet.
+# These are the only destinations that enter the tunnel; the default route
+# is never touched, so SSH, Tailscale and everything else stay direct.
+YALE_ROUTES=(
+  128.36.0.0/16
+  130.132.0.0/16
+  192.31.2.0/24
+  192.31.236.0/24
+  192.35.89.0/24
+  172.18.190.0/24
+)
 
-  read -r GATEWAY CLOUD_IFACE < <(
-    ip -4 route show default |
-      awk '$1 == "default" && $2 == "via" && $4 == "dev" {
-             print $3, $5
-             exit
-           }'
-  )
-  [[ -n ${GATEWAY:-} && -n ${CLOUD_IFACE:-} ]] || return 1
-  CLOUD_IP=$(
-    ip -o -4 addr show dev "$CLOUD_IFACE" scope global |
-      awk '{sub(/\/.*/, "", $4); print $4; exit}'
-  )
-  [[ -n $CLOUD_IP ]] || return 1
+# Names only Yale's internal resolver knows. vpn-slice resolves them once at
+# connect time and writes /etc/hosts, so no query ever has to leave for Yale
+# DNS -- which matters because Tailscale owns /etc/resolv.conf here.
+YALE_HOSTS=(
+  misha.ycrc.yale.edu
+  grace.ycrc.yale.edu
+  mccleary.ycrc.yale.edu
+  transfer-grace.ycrc.yale.edu
+  transfer-mccleary.ycrc.yale.edu
+)
 
-  install -d -m 0755 "$RUNTIME"
-  printf 'GATEWAY=%q\nCLOUD_IFACE=%q\nCLOUD_IP=%q\n' \
-    "$GATEWAY" "$CLOUD_IFACE" "$CLOUD_IP" >"$RUNTIME/cloud.env"
+slice_command() {
+  local parts=("$SLICE" --route-splits --no-ns-hosts)
+  [[ -n ${YALE_VPN_DUMP:-} ]] && parts+=(--dump)
+  parts+=("${YALE_ROUTES[@]}" "${YALE_HOSTS[@]}")
+  # openconnect runs --script through the shell, so quote every word.
+  printf '%q ' "${parts[@]}"
 }
 
-route_setup() {
-  cloud_network
-  ip route replace table "$TABLE" default via "$GATEWAY" dev "$CLOUD_IFACE"
-
-  while ip rule del priority 90 2>/dev/null; do :; done
-  while ip rule del priority 100 2>/dev/null; do :; done
-  ip rule add priority 90 fwmark "$MARK"/0xffffffff lookup "$TABLE"
-  ip rule add priority 100 from "$CLOUD_IP"/32 lookup "$TABLE"
-
-  nft delete table inet yale_management 2>/dev/null || true
-  nft -f - <<EOF
-table inet yale_management {
-  chain prerouting {
-    type filter hook prerouting priority mangle; policy accept;
-    iifname "$CLOUD_IFACE" tcp dport 22 ct mark set $MARK
-  }
-  chain output {
-    type route hook output priority mangle; policy accept;
-    ct mark $MARK meta mark set ct mark
-  }
-}
-EOF
-
-  sysctl -q -w net.ipv4.conf.all.rp_filter=2
-  sysctl -q -w "net.ipv4.conf.${CLOUD_IFACE}.rp_filter=2"
-  echo "SSH route: $CLOUD_IP -> $GATEWAY dev $CLOUD_IFACE"
-}
-
-route_is_healthy() {
-  cloud_network
-  ip route show table "$TABLE" default |
-    grep -Eq "^default via ${GATEWAY//./\\.} dev ${CLOUD_IFACE}([[:space:]]|$)" &&
-    ip rule show | grep -Eq '^90:.*fwmark 0x66.*lookup 200$' &&
-    ip rule show | grep -Eq "^100:.*from ${CLOUD_IP}.*lookup 200$" &&
-    nft list table inet yale_management >/dev/null 2>&1
-}
-
-watchdog() {
-  route_is_healthy && return
-  cloud_network || return
-  logger -t yale-vpn "SSH route drift detected; repairing"
-  route_setup
-}
-
-vpn_dns() {
-  for _ in {1..20}; do
-    ip link show "$TUN" >/dev/null 2>&1 && break
-    sleep 0.25
-  done
-  resolvectl dns "$TUN" "${YALE_DNS[@]}"
-  resolvectl domain "$TUN" '~ycrc.yale.edu'
-  resolvectl default-route "$TUN" no
+default_route_is_ours() {
+  ! ip route show default | grep -q "dev ${TUN}\b"
 }
 
 connect() {
@@ -100,7 +50,6 @@ connect() {
     return
   }
 
-  route_setup
   install -d -m 0700 "$RUNTIME"
   username="${1:-}"
   [[ -n $username ]] || read -r -p "Yale email (First.Last@yale.edu): " username
@@ -113,7 +62,7 @@ connect() {
 
   trap 'unset YALE_SSO_PASSWORD YALE_SSO_USER auth COOKIE' EXIT
   export YALE_SSO_USER="$username" YALE_SSO_PASSWORD
-  echo "Signing in with headless Chrome. Approve Duo if it appears."
+  echo "Signing in with headless Chromium. Approve Duo if it appears."
   if ! auth=$(
     openconnect \
       --protocol=anyconnect \
@@ -136,6 +85,7 @@ connect() {
     --protocol=anyconnect
     --useragent="$USER_AGENT"
     --interface="$TUN"
+    --script "$(slice_command)"
     --background
     --pid-file="$RUNTIME/openconnect.pid"
     --servercert="$FINGERPRINT"
@@ -147,23 +97,34 @@ connect() {
 
   printf '%s\n' "$COOKIE" | openconnect "${args[@]}" "$target"
   unset COOKIE auth
-  vpn_dns
+  sleep 2
   status
 }
 
 disconnect() {
-  resolvectl revert "$TUN" 2>/dev/null || true
+  # vpn-slice removes its own routes and /etc/hosts entries on teardown.
   if [[ -s $RUNTIME/openconnect.pid ]]; then
     kill -INT "$(<"$RUNTIME/openconnect.pid")" 2>/dev/null || true
   fi
   pkill -INT -x openconnect 2>/dev/null || true
   unlink "$RUNTIME/openconnect.pid" 2>/dev/null || true
-  route_setup
+}
+
+routes() {
+  echo "Routed into the tunnel:"
+  ip route show dev "$TUN" 2>/dev/null | sed 's/^/  /' || echo "  (tunnel is down)"
+  echo "Yale names in /etc/hosts:"
+  grep -i 'vpn-slice' /etc/hosts 2>/dev/null | sed 's/^/  /' || echo "  (none)"
 }
 
 status() {
   pgrep -a -x openconnect || echo "VPN is not running"
   ip -brief -4 address show "$TUN" 2>/dev/null || true
+  if default_route_is_ours; then
+    echo "Default route: unchanged (split tunnel)"
+  else
+    echo "WARNING: the tunnel captured the default route" >&2
+  fi
   printf 'Public IP: '
   curl -4fsS --max-time 10 https://checkip.amazonaws.com || true
 }
@@ -176,8 +137,10 @@ status() {
 case "${1:-}" in
   connect) connect "${2:-}" ;;
   disconnect) disconnect ;;
+  routes) routes ;;
   status) status ;;
-  route) route_setup ;;
-  watchdog) watchdog ;;
-  *) echo "usage: sudo yale-vpn {connect|status|disconnect}" >&2; exit 2 ;;
+  *)
+    echo "usage: yale-vpn {connect [EMAIL]|disconnect|status|routes}" >&2
+    exit 2
+    ;;
 esac

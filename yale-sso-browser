@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/opt/yale-vpn/venv/bin/python3
 """Finish Yale's Microsoft/Duo browser login for OpenConnect."""
 
 from __future__ import annotations
@@ -10,139 +10,134 @@ import tempfile
 import time
 from urllib.parse import urlsplit, urlunsplit
 
-from selenium import webdriver
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    StaleElementReferenceException,
-    WebDriverException,
-)
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Locator, Page, sync_playwright
 
 USER = os.environ.pop("YALE_SSO_USER", "")
 PASSWORD = os.environ.pop("YALE_SSO_PASSWORD", "")
 TIMEOUT = int(os.environ.get("YALE_SSO_TIMEOUT", "360"))
+
+# Chromium ships under /opt so root can reach it without a home directory.
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/yale-vpn/browsers")
+
+CLICKABLE = "button, a, input[type=submit], [role=button], label"
+DONE_PREFIX = "http://localhost:29786/"
 
 
 def log(message: str) -> None:
     print(f"[yale-sso] {message}", file=sys.stderr, flush=True)
 
 
-def visible(elements: list[WebElement]) -> list[WebElement]:
-    result = []
-    for element in elements:
-        try:
-            if element.is_displayed() and element.is_enabled():
-                result.append(element)
-        except StaleElementReferenceException:
-            pass
-    return result
+def first(page: Page, *selectors: str) -> Locator | None:
+    """First visible, enabled match for any selector, searched across frames.
 
-
-def first(driver: webdriver.Chrome, *selectors: str) -> WebElement | None:
+    Duo renders inside an iframe, so every lookup spans page.frames rather
+    than tracking which frame is current the way switch_to.frame did.
+    """
     for selector in selectors:
-        elements = visible(driver.find_elements(By.CSS_SELECTOR, selector))
-        if elements:
-            return elements[0]
+        for frame in page.frames:
+            try:
+                locator = frame.locator(selector)
+                for index in range(min(locator.count(), 8)):
+                    candidate = locator.nth(index)
+                    if candidate.is_visible() and candidate.is_enabled():
+                        return candidate
+            except PlaywrightError:
+                pass
     return None
 
 
-def wait_for(driver: webdriver.Chrome, *selectors: str) -> WebElement:
-    return WebDriverWait(
-        driver,
-        40,
-        ignored_exceptions=(NoSuchElementException, StaleElementReferenceException),
-    ).until(lambda current: first(current, *selectors))
+def wait_for(page: Page, *selectors: str, seconds: int = 40) -> Locator:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        found = first(page, *selectors)
+        if found is not None:
+            return found
+        page.wait_for_timeout(250)
+    raise TimeoutError(f"no element matched {selectors}")
 
 
-def submit(driver: webdriver.Chrome, field: WebElement) -> None:
-    button = first(driver, "input[type=submit]", "button[type=submit]", "button")
+def submit(page: Page, field: Locator) -> None:
+    button = first(page, "input[type=submit]", "button[type=submit]", "button")
     try:
         if button is not None:
-            button.click()
+            button.click(timeout=5000)
         else:
-            field.send_keys(Keys.ENTER)
-    except WebDriverException:
-        field.send_keys(Keys.ENTER)
-
-
-def page_text(driver: webdriver.Chrome) -> str:
-    try:
-        return driver.find_element(By.TAG_NAME, "body").text.casefold()
-    except (NoSuchElementException, StaleElementReferenceException):
-        return ""
-
-
-def enter_duo_frame(driver: webdriver.Chrome) -> None:
-    driver.switch_to.default_content()
-    for frame in driver.find_elements(By.TAG_NAME, "iframe"):
+            field.press("Enter", timeout=5000)
+    except PlaywrightError:
         try:
-            driver.switch_to.frame(frame)
-            if visible(driver.find_elements(By.CSS_SELECTOR, "button, input")):
-                return
-            driver.switch_to.default_content()
-        except (StaleElementReferenceException, WebDriverException):
-            driver.switch_to.default_content()
-
-
-def click_text(driver: webdriver.Chrome, *needles: str) -> bool:
-    elements = visible(
-        driver.find_elements(
-            By.CSS_SELECTOR,
-            "button, a, input[type=submit], [role=button], label",
-        )
-    )
-    for element in elements:
-        try:
-            text = (
-                element.text
-                or element.get_attribute("value")
-                or element.get_attribute("aria-label")
-                or ""
-            ).strip()
-            if any(needle in text.casefold() for needle in needles):
-                element.click()
-                return True
-        except (StaleElementReferenceException, WebDriverException):
+            field.press("Enter", timeout=5000)
+        except PlaywrightError:
             pass
+
+
+def page_text(page: Page) -> str:
+    text = []
+    for frame in page.frames:
+        try:
+            text.append(frame.inner_text("body", timeout=2000))
+        except PlaywrightError:
+            pass
+    return "\n".join(text).casefold()
+
+
+def click_text(page: Page, *needles: str) -> bool:
+    for frame in page.frames:
+        try:
+            locator = frame.locator(CLICKABLE)
+            count = min(locator.count(), 40)
+        except PlaywrightError:
+            continue
+        for index in range(count):
+            element = locator.nth(index)
+            try:
+                if not (element.is_visible() and element.is_enabled()):
+                    continue
+                label = (
+                    element.inner_text(timeout=1000)
+                    or element.get_attribute("value")
+                    or element.get_attribute("aria-label")
+                    or ""
+                ).strip()
+                if any(needle in label.casefold() for needle in needles):
+                    element.click(timeout=5000)
+                    return True
+            except PlaywrightError:
+                pass
     return False
 
 
-def authenticate(driver: webdriver.Chrome) -> None:
+def authenticate(page: Page) -> None:
     username = first(
-        driver,
+        page,
         "input[type=email]",
         "input[autocomplete=username]",
         "input[name=loginfmt]",
     )
     password = first(
-        driver,
+        page,
         "input[type=password]",
         "input[autocomplete=current-password]",
     )
 
     if username is not None and password is None:
         log("Submitting Yale email")
-        username.send_keys(USER)
-        submit(driver, username)
+        username.fill(USER)
+        submit(page, username)
         password = wait_for(
-            driver,
+            page,
             "input[type=password]",
             "input[autocomplete=current-password]",
         )
 
     password = password or wait_for(
-        driver,
+        page,
         "input[type=password]",
         "input[autocomplete=current-password]",
     )
     log("Submitting NetID password")
-    password.send_keys(PASSWORD)
-    submit(driver, password)
+    password.fill(PASSWORD)
+    submit(page, password)
 
     deadline = time.monotonic() + TIMEOUT
     last_click: dict[str, float] = {}
@@ -152,28 +147,26 @@ def authenticate(driver: webdriver.Chrome) -> None:
         now = time.monotonic()
         if now - last_click.get(name, 0) < seconds:
             return False
-        if click_text(driver, *needles):
+        if click_text(page, *needles):
             last_click[name] = now
             return True
         return False
 
     while time.monotonic() < deadline:
-        if driver.current_url.startswith("http://localhost:29786/"):
+        if page.url.startswith(DONE_PREFIX):
             log("Authentication complete")
             return
 
-        driver.switch_to.default_content()
-        text = page_text(driver)
+        text = page_text(page)
         if "validation failure" in text:
             raise RuntimeError("Yale rejected or expired the SAML response")
 
-        stay_signed_in = first(driver, "#idBtn_Back")
+        stay_signed_in = first(page, "#idBtn_Back")
         if "stay signed in" in text and stay_signed_in is not None:
-            stay_signed_in.click()
-            time.sleep(2)
+            stay_signed_in.click(timeout=5000)
+            page.wait_for_timeout(2000)
             continue
 
-        enter_duo_frame(driver)
         if click_every(
             "duo",
             8,
@@ -196,14 +189,12 @@ def authenticate(driver: webdriver.Chrome) -> None:
             log("Duo approved")
 
         if not push_logged and (
-            "check for a duo push" in page_text(driver)
-            or "sent a push" in page_text(driver)
+            "check for a duo push" in text or "sent a push" in text
         ):
             log("Duo push sent")
             push_logged = True
 
-        driver.switch_to.default_content()
-        time.sleep(1)
+        page.wait_for_timeout(1000)
 
     raise TimeoutError("timed out waiting for Yale/Duo")
 
@@ -215,53 +206,48 @@ def main() -> int:
 
     runtime = "/run/yale-vpn"
     os.makedirs(runtime, mode=0o700, exist_ok=True)
+    # /run is tmpfs, so the profile never reaches disk.
     profile = tempfile.mkdtemp(prefix="chrome-", dir=runtime)
 
-    options = Options()
-    options.binary_location = "/usr/bin/google-chrome-stable"
-    options.page_load_strategy = "eager"
-    for argument in (
-        "--headless=new",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions",
-        "--incognito",
-        "--no-first-run",
-        "--password-store=basic",
-        f"--user-data-dir={profile}",
-    ):
-        options.add_argument(argument)
-
-    driver: webdriver.Chrome | None = None
+    page: Page | None = None
     try:
-        driver_path = "/snap/chromium/current/usr/lib/chromium-browser/chromedriver"
-        driver = webdriver.Chrome(
-            service=Service(driver_path),
-            options=options,
-        )
-        driver.set_page_load_timeout(30)
-        driver.get(sys.argv[1])
+        with sync_playwright() as driver:
+            context = driver.chromium.launch_persistent_context(
+                profile,
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--no-first-run",
+                    "--password-store=basic",
+                ],
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.set_default_timeout(30000)
+                page.goto(sys.argv[1], wait_until="domcontentloaded", timeout=30000)
 
-        if not USER or not PASSWORD:
-            log("browser probe succeeded")
-            return 3
+                if not USER or not PASSWORD:
+                    log("browser probe succeeded")
+                    return 3
 
-        authenticate(driver)
-        return 0
+                authenticate(page)
+                return 0
+            finally:
+                context.close()
     except Exception as error:
         log(f"{type(error).__name__}: {error}")
-        if driver is not None:
-            url = urlsplit(driver.current_url)
-            safe_url = urlunsplit((url.scheme, url.netloc, url.path, "", ""))
-            log(f"Stopped at {safe_url}")
+        if page is not None:
+            try:
+                url = urlsplit(page.url)
+                safe_url = urlunsplit((url.scheme, url.netloc, url.path, "", ""))
+                log(f"Stopped at {safe_url}")
+            except PlaywrightError:
+                pass
         return 1
     finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except WebDriverException:
-                pass
         shutil.rmtree(profile, ignore_errors=True)
 
 

@@ -23,12 +23,12 @@ YALE_ROUTES=(
 # Names only Yale's internal resolver knows. vpn-slice resolves them once at
 # connect time and writes /etc/hosts, so no query ever has to leave for Yale
 # DNS -- which matters because Tailscale owns /etc/resolv.conf here.
+# Keep in step with the cluster hosts in ssh_config.
 YALE_HOSTS=(
-  misha.ycrc.yale.edu
+  bouchet.ycrc.yale.edu
   grace.ycrc.yale.edu
   mccleary.ycrc.yale.edu
-  transfer-grace.ycrc.yale.edu
-  transfer-mccleary.ycrc.yale.edu
+  login1.misha.ycrc.yale.edu
 )
 
 slice_command() {

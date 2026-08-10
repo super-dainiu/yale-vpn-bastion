@@ -23,16 +23,25 @@ os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/yale-vpn/browsers")
 CLICKABLE = "button, a, input[type=submit], [role=button], label"
 DONE_PREFIX = "http://localhost:29786/"
 
+# Microsoft's email page carries a 10x13 px decoy password box that Playwright
+# reports as visible. Without a width floor the login believes it is already on
+# the password step, so it never submits the email and stalls there until the
+# timeout. Real fields are full width.
+FIELD_MIN_WIDTH = 100
+
 
 def log(message: str) -> None:
     print(f"[yale-sso] {message}", file=sys.stderr, flush=True)
 
 
-def first(page: Page, *selectors: str) -> Locator | None:
+def first(page: Page, *selectors: str, min_width: float = 0) -> Locator | None:
     """First visible, enabled match for any selector, searched across frames.
 
     Duo renders inside an iframe, so every lookup spans page.frames rather
     than tracking which frame is current the way switch_to.frame did.
+
+    min_width skips matches narrower than that, which is what separates a
+    real input from a decoy one.
     """
     for selector in selectors:
         for frame in page.frames:
@@ -40,17 +49,24 @@ def first(page: Page, *selectors: str) -> Locator | None:
                 locator = frame.locator(selector)
                 for index in range(min(locator.count(), 8)):
                     candidate = locator.nth(index)
-                    if candidate.is_visible() and candidate.is_enabled():
-                        return candidate
+                    if not (candidate.is_visible() and candidate.is_enabled()):
+                        continue
+                    if min_width:
+                        box = candidate.bounding_box()
+                        if box is None or box["width"] < min_width:
+                            continue
+                    return candidate
             except PlaywrightError:
                 pass
     return None
 
 
-def wait_for(page: Page, *selectors: str, seconds: int = 40) -> Locator:
+def wait_for(
+    page: Page, *selectors: str, seconds: int = 40, min_width: float = 0
+) -> Locator:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        found = first(page, *selectors)
+        found = first(page, *selectors, min_width=min_width)
         if found is not None:
             return found
         page.wait_for_timeout(250)
@@ -113,11 +129,13 @@ def authenticate(page: Page) -> None:
         "input[type=email]",
         "input[autocomplete=username]",
         "input[name=loginfmt]",
+        min_width=FIELD_MIN_WIDTH,
     )
     password = first(
         page,
         "input[type=password]",
         "input[autocomplete=current-password]",
+        min_width=FIELD_MIN_WIDTH,
     )
 
     if username is not None and password is None:
@@ -128,12 +146,14 @@ def authenticate(page: Page) -> None:
             page,
             "input[type=password]",
             "input[autocomplete=current-password]",
+            min_width=FIELD_MIN_WIDTH,
         )
 
     password = password or wait_for(
         page,
         "input[type=password]",
         "input[autocomplete=current-password]",
+        min_width=FIELD_MIN_WIDTH,
     )
     log("Submitting NetID password")
     password.fill(PASSWORD)

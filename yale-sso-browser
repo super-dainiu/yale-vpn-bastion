@@ -29,6 +29,16 @@ DONE_PREFIX = "http://localhost:29786/"
 # timeout. Real fields are full width.
 FIELD_MIN_WIDTH = 100
 
+USERNAME_FIELDS = (
+    "input[type=email]",
+    "input[autocomplete=username]",
+    "input[name=loginfmt]",
+)
+PASSWORD_FIELDS = (
+    "input[type=password]",
+    "input[autocomplete=current-password]",
+)
+
 
 def log(message: str) -> None:
     print(f"[yale-sso] {message}", file=sys.stderr, flush=True)
@@ -124,36 +134,23 @@ def click_text(page: Page, *needles: str) -> bool:
 
 
 def authenticate(page: Page) -> None:
-    username = first(
-        page,
-        "input[type=email]",
-        "input[autocomplete=username]",
-        "input[name=loginfmt]",
-        min_width=FIELD_MIN_WIDTH,
-    )
-    password = first(
-        page,
-        "input[type=password]",
-        "input[autocomplete=current-password]",
-        min_width=FIELD_MIN_WIDTH,
-    )
+    # Microsoft renders the sign-in form well after domcontentloaded. Wait for
+    # a field to exist before deciding which step this is, otherwise both
+    # lookups come back empty and the password wait below runs out the clock
+    # against a page that is still asking for the email.
+    wait_for(page, *USERNAME_FIELDS, *PASSWORD_FIELDS, min_width=FIELD_MIN_WIDTH)
+
+    username = first(page, *USERNAME_FIELDS, min_width=FIELD_MIN_WIDTH)
+    password = first(page, *PASSWORD_FIELDS, min_width=FIELD_MIN_WIDTH)
 
     if username is not None and password is None:
         log("Submitting Yale email")
         username.fill(USER)
         submit(page, username)
-        password = wait_for(
-            page,
-            "input[type=password]",
-            "input[autocomplete=current-password]",
-            min_width=FIELD_MIN_WIDTH,
-        )
+        password = wait_for(page, *PASSWORD_FIELDS, min_width=FIELD_MIN_WIDTH)
 
     password = password or wait_for(
-        page,
-        "input[type=password]",
-        "input[autocomplete=current-password]",
-        min_width=FIELD_MIN_WIDTH,
+        page, *PASSWORD_FIELDS, min_width=FIELD_MIN_WIDTH
     )
     log("Submitting NetID password")
     password.fill(PASSWORD)
